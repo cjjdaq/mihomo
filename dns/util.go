@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/picker"
@@ -25,6 +26,52 @@ const (
 
 const serverFailureCacheTTL uint32 = 5
 
+// 默认值（导出供 config 包引用，避免重复硬编码）
+const (
+	DefaultMinCacheTTL        uint32 = 300                   // 默认最少缓存 300 秒
+	DefaultMaxCacheTTL        uint32 = 3600                  // 默认最多缓存 1 小时
+	defaultOptimisticStaleMax        = int64(24 * time.Hour) // 乐观缓存最大允许过期时间
+)
+
+// 全局配置变量（使用 atomic 保证并发安全）
+var (
+	atomicMinCacheTTL        atomic.Uint32
+	atomicMaxCacheTTL        atomic.Uint32
+	atomicOptimisticStaleMax atomic.Int64
+)
+
+func init() {
+	atomicMinCacheTTL.Store(DefaultMinCacheTTL)
+	atomicMaxCacheTTL.Store(DefaultMaxCacheTTL)
+	atomicOptimisticStaleMax.Store(defaultOptimisticStaleMax)
+}
+
+// optimisticStaleMax 读取当前乐观缓存过期窗口
+func optimisticStaleMax() time.Duration {
+	return time.Duration(atomicOptimisticStaleMax.Load())
+}
+
+// SetOptimisticStaleMax 设置乐观缓存最大过期时间（并发安全）。0 表示禁用。
+func SetOptimisticStaleMax(d time.Duration) {
+	atomicOptimisticStaleMax.Store(int64(d))
+	log.Infoln("[DNS] Optimistic stale max set to: %v", d)
+}
+
+// SetCacheTTLLimits 设置缓存 TTL 限制（并发安全）
+func SetCacheTTLLimits(min, max uint32) {
+	if min > 0 {
+		atomicMinCacheTTL.Store(min)
+	}
+	if max > 0 && max >= min {
+		atomicMaxCacheTTL.Store(max)
+	}
+	log.Infoln("[DNS] Cache TTL limits set to: min=%d, max=%d", atomicMinCacheTTL.Load(), atomicMaxCacheTTL.Load())
+}
+
+// GetCacheTTLLimits 获取当前缓存 TTL 限制（并发安全）
+func GetCacheTTLLimits() (min, max uint32) {
+	return atomicMinCacheTTL.Load(), atomicMaxCacheTTL.Load()
+}
 func minimalTTL(records []D.RR) uint32 {
 	rr := lo.MinBy(records, func(r1 D.RR, r2 D.RR) bool {
 		return r1.Header().Ttl < r2.Header().Ttl
@@ -39,9 +86,27 @@ func updateTTL(records []D.RR, ttl uint32) {
 	if len(records) == 0 {
 		return
 	}
-	delta := minimalTTL(records) - ttl
+
+	min := minimalTTL(records)
+	if min == 0 {
+		return
+	}
+
+	if ttl >= min {
+		// 目标 TTL 更大：把小于 ttl 的 RR 抬到 ttl（不动更大的）
+		for i := range records {
+			if records[i].Header().Ttl < ttl {
+				records[i].Header().Ttl = ttl
+			}
+		}
+		return
+	}
+
+	// 目标 TTL 更小：按共同 delta 下调（保持各 RR 的相对差）
+	delta := min - ttl
 	for i := range records {
-		records[i].Header().Ttl = lo.Clamp(records[i].Header().Ttl-delta, 1, records[i].Header().Ttl)
+		old := records[i].Header().Ttl
+		records[i].Header().Ttl = lo.Clamp(old-delta, 1, old)
 	}
 }
 
@@ -81,6 +146,16 @@ func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
 	}
 	if ttl == 0 {
 		return
+	}
+
+	// clamp cache TTL（原子读取，并发安全）
+	minTTL := atomicMinCacheTTL.Load()
+	maxTTL := atomicMaxCacheTTL.Load()
+	if ttl < minTTL {
+		ttl = minTTL
+	}
+	if ttl > maxTTL {
+		ttl = maxTTL
 	}
 
 	c.SetWithExpire(q.String(), msg, time.Now().Add(time.Duration(ttl)*time.Second))
@@ -136,6 +211,9 @@ func transform(servers []NameServer, resolver resolver.Resolver) []dnsClient {
 			c = newClient(s.Addr, resolver, s.Net, s.Params, s.ProxyAdapter, s.ProxyName)
 		}
 		c = rewrapClient(c, s.Params)
+		if s.UseDirectWhenProxyIsDirect && s.ProxyName != "" {
+			c = conditionalDNSClient{dnsClient: c, proxyName: s.ProxyName, useDirect: true}
+		}
 		ret = append(ret, c)
 	}
 	return ret
@@ -236,6 +314,50 @@ func wrapClientWithDisableTypes(c dnsClient, params map[string]string) dnsClient
 		return clientWithDisableTypes{c, disableTypes}
 	}
 	return c
+}
+
+type conditionalDNSClient struct {
+	dnsClient
+	proxyName string
+	useDirect bool
+}
+
+func (c conditionalDNSClient) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
+	if !c.useDirect || c.proxyName == "" {
+		return c.dnsClient.ExchangeContext(ctx, m)
+	}
+
+	if proxyResolvesToDirect(c.proxyName, msgToDomain(m)) {
+		if dr := resolver.DirectHostResolver; dr != nil && dr.Invalid() {
+			log.Debugln("[DNS] direct-on-direct: proxy %s resolves to DIRECT, using DirectHostResolver", c.proxyName)
+			return dr.ExchangeContext(ctx, m)
+		}
+	}
+
+	return c.dnsClient.ExchangeContext(ctx, m)
+}
+
+func (c conditionalDNSClient) ResetConnection() {
+	c.dnsClient.ResetConnection()
+}
+
+// ProxyDirectCheckerFunc 判断指定代理名称（及域名上下文）是否最终解析为 DIRECT/COMPATIBLE 代理。
+// 由 tunnel 包在初始化时通过 RegisterProxyDirectChecker 注册，解除 dns→tunnel 包级依赖。
+type ProxyDirectCheckerFunc func(proxyName, domain string) bool
+
+var proxyDirectCheckerPtr atomic.Pointer[ProxyDirectCheckerFunc]
+
+// RegisterProxyDirectChecker 注册代理直连检查回调（由 tunnel 包调用，并发安全）
+func RegisterProxyDirectChecker(fn ProxyDirectCheckerFunc) {
+	proxyDirectCheckerPtr.Store(&fn)
+}
+
+// proxyResolvesToDirect 通过注册的回调判断代理是否解析为 DIRECT
+func proxyResolvesToDirect(proxyName, domain string) bool {
+	if p := proxyDirectCheckerPtr.Load(); p != nil {
+		return (*p)(proxyName, domain)
+	}
+	return false
 }
 
 type clientWithEdns0Subnet struct {
