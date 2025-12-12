@@ -467,6 +467,9 @@ func handleUDPConn(packet C.PacketAdapter) {
 			if err != nil {
 				return nil, nil, err
 			}
+			if resolver.FakeIPEnabled() && metadata.DNSMode == C.DNSFakeIP && metadata.Type != C.INNER {            
+               metadata.DstIP = netip.Addr{}
+            }
 			logMetadata(metadata, rule, rawPc)
 
 			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
@@ -602,6 +605,9 @@ func handleTCPConn(connCtx C.ConnContext) {
 	if err != nil {
 		return
 	}
+	if resolver.FakeIPEnabled() && metadata.DNSMode == C.DNSFakeIP && metadata.Type != C.INNER {            
+       metadata.DstIP = netip.Addr{}
+    }
 	logMetadata(metadata, rule, remoteConn)
 
 	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, int64(peekLen), 0, true)
