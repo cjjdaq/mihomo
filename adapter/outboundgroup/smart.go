@@ -1887,10 +1887,7 @@ func (s *Smart) lookupASNByIPCached(ip netip.Addr) (string, string) {
 
     nowN := time.Now().UnixNano()
     if e, ok := s.asnCache.get(k, nowN); ok {
-		if log.Level() <= log.DEBUG {
-           log.Debugln("[Smart][ASN] cache hit: %s -> %s %s",
-           ip.String(), e.asn, e.aso)
-        }
+           log.Debugln("[Smart][ASN] cache hit: %s -> %s %s",ip.String(), e.asn, e.aso)
         return e.asn, e.aso
     }
 
