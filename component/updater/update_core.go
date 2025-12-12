@@ -27,8 +27,8 @@ const (
 	baseReleaseURL    = "https://github.com/MetaCubeX/mihomo/releases/latest/download/"
 	versionReleaseURL = "https://github.com/MetaCubeX/mihomo/releases/latest/download/version.txt"
 
-	baseAlphaURL    = "https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/"
-	versionAlphaURL = "https://github.com/vernesong/mihomo/releases/download/Prerelease-Alpha/version.txt"
+	baseAlphaURL    = "https://github.com/cjjdaq/mihomo/releases/download/Prerelease-test-dev/"
+	versionAlphaURL = "https://github.com/cjjdaq/mihomo/releases/download/Prerelease-test-dev/version.txt"
 
 	// MaxPackageFileSize is a maximum package file length in bytes. The largest
 	// package whose size is limited by this constant currently has the size of
@@ -38,7 +38,7 @@ const (
 
 const (
 	ReleaseChannel = "release"
-	AlphaChannel   = "alpha"
+	AlphaChannel   = "test-dev"
 )
 
 // CoreUpdater is the mihomo updater.
@@ -95,7 +95,7 @@ func (u *CoreUpdater) Update(currentExePath string, channel string, force bool) 
 	case AlphaChannel:
 		break
 	default: // auto
-		if !strings.HasPrefix(C.Version, "alpha") {
+		if !strings.HasPrefix(C.Version, "test-dev") {
 			baseURL = baseReleaseURL
 			versionURL = versionReleaseURL
 		}
