@@ -241,6 +241,34 @@ func updateNTP(c *config.NTP) {
 }
 
 func updateDNS(c *config.DNS, generalIPv6 bool) {
+	// 注册代理直连检查回调，解耦 dns→tunnel 包级依赖
+	dns.RegisterProxyDirectChecker(func(proxyName, domain string) bool {
+		proxy, ok := tunnel.Proxies()[proxyName]
+		if !ok || proxy == nil {
+			return false
+		}
+		metadata := &C.Metadata{
+			NetWork: C.UDP,
+			Type:    C.INNER,
+			Host:    domain,
+		}
+		leaf := proxy
+		// 最多展开 8 层代理嵌套，防止循环引用导致死循环
+		for i := 0; i < 8; i++ {
+			unwrapped := leaf.Unwrap(metadata, false)
+			if unwrapped == nil || unwrapped == leaf {
+				break
+			}
+			leaf = unwrapped
+		}
+		switch leaf.Type() {
+		case C.Direct, C.Compatible:
+			return true
+		default:
+			return false
+		}
+	})
+
 	if !c.Enable {
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil

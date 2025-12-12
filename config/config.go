@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	_ "unsafe"
@@ -232,6 +233,8 @@ type RawDNS struct {
 	UseHosts                     bool                                `yaml:"use-hosts" json:"use-hosts"`
 	UseSystemHosts               bool                                `yaml:"use-system-hosts" json:"use-system-hosts"`
 	RespectRules                 bool                                `yaml:"respect-rules" json:"respect-rules"`
+	MinCacheTTL                  *uint32                             `yaml:"min-cache-ttl,omitempty"` // 最小缓存 TTL（秒）
+	MaxCacheTTL                  *uint32                             `yaml:"max-cache-ttl,omitempty"` // 最大缓存 TTL（秒）
 	NameServer                   []string                            `yaml:"nameserver" json:"nameserver"`
 	Fallback                     []string                            `yaml:"fallback" json:"fallback"`
 	FallbackFilter               RawFallbackFilter                   `yaml:"fallback-filter" json:"fallback-filter"`
@@ -488,29 +491,29 @@ func Parse(buf []byte) (*Config, error) {
 
 func DefaultRawConfig() *RawConfig {
 	return &RawConfig{
-		AllowLan:          false,
-		BindAddress:       "*",
-		LanAllowedIPs:     []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
-		IPv6:              true,
-		Mode:              T.Rule,
-		GeoAutoUpdate:     false,
-		GeoUpdateInterval: 24,
-		GeodataMode:       geodata.GeodataMode(),
-		GeodataLoader:     "memconservative",
-		LgbmAutoUpdate:    false,
-		LgbmUpdateInterval:72,
-		LgbmUrl:           lightgbm.GetModelDownloadURL(),
-		UnifiedDelay:      false,
-		Authentication:    []string{},
-		LogLevel:          log.INFO,
-		Hosts:             map[string]any{},
-		Rule:              []string{},
-		Proxy:             []map[string]any{},
-		ProxyGroup:        []map[string]any{},
-		TCPConcurrent:     false,
-		FindProcessMode:   process.FindProcessStrict,
-		GlobalUA:          "clash.meta/" + C.Version,
-		ETagSupport:       true,
+		AllowLan:           false,
+		BindAddress:        "*",
+		LanAllowedIPs:      []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+		IPv6:               true,
+		Mode:               T.Rule,
+		GeoAutoUpdate:      false,
+		GeoUpdateInterval:  24,
+		GeodataMode:        geodata.GeodataMode(),
+		GeodataLoader:      "memconservative",
+		LgbmAutoUpdate:     false,
+		LgbmUpdateInterval: 72,
+		LgbmUrl:            lightgbm.GetModelDownloadURL(),
+		UnifiedDelay:       false,
+		Authentication:     []string{},
+		LogLevel:           log.INFO,
+		Hosts:              map[string]any{},
+		Rule:               []string{},
+		Proxy:              []map[string]any{},
+		ProxyGroup:         []map[string]any{},
+		TCPConcurrent:      false,
+		FindProcessMode:    process.FindProcessStrict,
+		GlobalUA:           "clash.meta/" + C.Version,
+		ETagSupport:        true,
 		DNS: RawDNS{
 			Enable:         false,
 			IPv6:           false,
@@ -1224,6 +1227,7 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 		}
 
 		var proxyName string
+		var directOnDirect bool
 		params := map[string]string{}
 		for _, s := range strings.Split(u.Fragment, "&") {
 			arr := strings.SplitN(s, "=", 2)
@@ -1231,6 +1235,12 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 			case 1:
 				proxyName = arr[0]
 			case 2:
+				if strings.EqualFold(arr[0], "direct-on-direct") {
+					if val, err := strconv.ParseBool(arr[1]); err == nil {
+						directOnDirect = val
+					}
+					continue
+				}
 				params[arr[0]] = arr[1]
 			}
 		}
@@ -1300,11 +1310,12 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 		}
 
 		nameserver := dns.NameServer{
-			Net:       dnsNetType,
-			Addr:      addr,
-			ProxyName: proxyName,
-			Params:    params,
-			PreferH3:  preferH3,
+			Net:                        dnsNetType,
+			Addr:                       addr,
+			ProxyName:                  proxyName,
+			Params:                     params,
+			PreferH3:                   preferH3,
+			UseDirectWhenProxyIsDirect: directOnDirect,
 		}
 		if slices.ContainsFunc(nameservers, nameserver.Equal) {
 			continue // skip duplicates nameserver
@@ -1476,6 +1487,27 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 	}
 	if dnsCfg.DefaultNameserver, err = parseNameServer(cfg.DefaultNameserver, false, cfg.PreferH3); err != nil {
 		return nil, err
+	}
+	// 应用缓存 TTL 配置
+	if cfg.MinCacheTTL != nil || cfg.MaxCacheTTL != nil {
+		var minTTL uint32 = dns.DefaultMinCacheTTL
+		var maxTTL uint32 = dns.DefaultMaxCacheTTL
+
+		if cfg.MinCacheTTL != nil {
+			minTTL = *cfg.MinCacheTTL
+		}
+
+		if cfg.MaxCacheTTL != nil {
+			maxTTL = *cfg.MaxCacheTTL
+		}
+
+		// 验证配置合理性
+		if minTTL > maxTTL {
+			return nil, fmt.Errorf("min-cache-ttl (%d) cannot be greater than max-cache-ttl (%d)", minTTL, maxTTL)
+		}
+
+		// 设置到 DNS 模块
+		dns.SetCacheTTLLimits(minTTL, maxTTL)
 	}
 	// check default nameserver is pure ip addr
 	for _, ns := range dnsCfg.DefaultNameserver {
