@@ -21,7 +21,10 @@ const (
 )
 
 const serverFailureCacheTTL uint32 = 5
-
+const (
+	minCacheTTL uint32 = 300    // 最少缓存 300 秒（可自行调整）
+	maxCacheTTL uint32 = 3600  // 最多缓存 1 小时（可自行调整）
+)
 func minimalTTL(records []D.RR) uint32 {
 	rr := lo.MinBy(records, func(r1 D.RR, r2 D.RR) bool {
 		return r1.Header().Ttl < r2.Header().Ttl
@@ -36,9 +39,27 @@ func updateTTL(records []D.RR, ttl uint32) {
 	if len(records) == 0 {
 		return
 	}
-	delta := minimalTTL(records) - ttl
+
+	min := minimalTTL(records)
+	if min == 0 {
+		return
+	}
+
+	if ttl >= min {
+		// 目标 TTL 更大：把小于 ttl 的 RR 抬到 ttl（不动更大的）
+		for i := range records {
+			if records[i].Header().Ttl < ttl {
+				records[i].Header().Ttl = ttl
+			}
+		}
+		return
+	}
+
+	// 目标 TTL 更小：按共同 delta 下调（保持各 RR 的相对差）
+	delta := min - ttl
 	for i := range records {
-		records[i].Header().Ttl = lo.Clamp(records[i].Header().Ttl-delta, 1, records[i].Header().Ttl)
+		old := records[i].Header().Ttl
+		records[i].Header().Ttl = lo.Clamp(old-delta, 1, old)
 	}
 }
 
@@ -60,6 +81,15 @@ func putMsgToCache(c dnsCache, key string, q D.Question, msg *D.Msg) {
 	if ttl == 0 {
 		return
 	}
+
+	// clamp cache TTL
+	if ttl < minCacheTTL {
+		ttl = minCacheTTL
+	}
+	if ttl > maxCacheTTL {
+		ttl = maxCacheTTL
+	}
+
 	c.SetWithExpire(key, msg.Copy(), time.Now().Add(time.Duration(ttl)*time.Second))
 }
 
