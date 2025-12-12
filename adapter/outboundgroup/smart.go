@@ -24,7 +24,6 @@ import (
 	"github.com/metacubex/mihomo/common/xsync"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/geodata"
-	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/smart"
@@ -60,8 +59,8 @@ const (
 )
 
 var (
-	flushQueueOnce       atomic.Bool
-	smartInitOnce        sync.Once
+	flushQueueOnce atomic.Bool
+	smartInitOnce  sync.Once
 )
 
 type SmartOption struct {
@@ -75,17 +74,17 @@ type SmartOption struct {
 
 type Smart struct {
 	*GroupBase
-	store                  *smart.Store
+	store *smart.Store
 
-	wg                     sync.WaitGroup
-	ctx                    context.Context
-	cancel                 context.CancelFunc
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	configName             string
-	selected               string
-	testUrl                string
-	expectedStatus         string
-	disableUDP             bool
+	configName     string
+	selected       string
+	testUrl        string
+	expectedStatus string
+	disableUDP     bool
 
 	dataCollector          *lightgbm.DataCollector
 	weightModel            *lightgbm.WeightModel
@@ -173,7 +172,6 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	}
 
 	s.InitSmart()
-
 	return s, nil
 }
 
@@ -818,18 +816,20 @@ func (s *Smart) InitSmart() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	smartInitOnce.Do(func() {
-		s.startTimedTask(5*time.Minute, checkInterval, "Global orphaned groups Clean up", s.cleanupOrphanedGroups, true)
-		s.startTimedTask(5*time.Second, cacheParamAdjustInterval, "Global cache parameters adjustment", s.store.AdjustCacheParameters, false)
-		s.startTimedTask(5*time.Minute, flushQueueInterval, "Global queues flush", func() {
+		s.startTimedTask(30*time.Second, asnCacheCleanupInterval, "ASN cache cleanup", s.cleanupASNCache, false)
+		s.startTimedTask(5*time.Minute, checkInterval, "Clean up groups", s.cleanupOrphanedGroups, true)
+		s.startTimedTask(5*time.Second, cacheParamAdjustInterval, "Cache parameter adjustment", s.store.AdjustCacheParameters, false)
+		s.startTimedTask(5*time.Minute, flushQueueInterval, "Queue flush", func() {
 			s.store.FlushQueue(true)
 		}, false)
-		// try load ASN database
-		if s.preferASN {
-			if err := geodata.InitASN(); err != nil {
-				log.Warnln("[Smart] Failed to load ASN database: %v", err)
-			}
-		}
 	})
+
+	// 每个组独立尝试加载 ASN 数据库，避免仅第一个组决定是否加载
+	if s.preferASN {
+		if err := geodata.InitASN(); err != nil {
+			log.Warnln("[Smart] Failed to load ASN database: %v", err)
+		}
+	}
 
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
 	s.startTimedTask(5*time.Minute, prefetchInterval, "Group targets prefetch", s.runPrefetch, false)
@@ -2023,11 +2023,15 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 			ip = metadata.DstIP
 		}
 
-		asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
+		asn, aso := s.lookupASNByIPCached(ip)
 		if asn == "" {
 			metadata.DstIPASN = "unknown"
-		} else {
+			return ""
+		}
+		if aso != "" {
 			metadata.DstIPASN = asn + " " + aso
+		} else {
+			metadata.DstIPASN = asn
 		}
 		return asn
 	}
