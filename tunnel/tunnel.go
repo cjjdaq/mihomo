@@ -275,6 +275,14 @@ func isHandle(t C.Type) bool {
 	return status == Running || (status == Inner && t == C.INNER)
 }
 
+// clearFakeIPDstIfNeeded 如果启用了 FakeIP 且当前连接使用 FakeIP 模式，清除目标 IP
+// 以确保后续日志和统计不会记录虚假的 IP 地址
+func clearFakeIPDstIfNeeded(metadata *C.Metadata) {
+	if resolver.FakeIPEnabled() && metadata.DNSMode == C.DNSFakeIP && metadata.Type != C.INNER {
+		metadata.DstIP = netip.Addr{}
+	}
+}
+
 func fixMetadata(metadata *C.Metadata) {
 	// first unmap dstIP
 	metadata.DstIP = metadata.DstIP.Unmap()
@@ -477,6 +485,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			if err != nil {
 				return nil, nil, err
 			}
+			clearFakeIPDstIfNeeded(metadata)
 			logMetadata(metadata, rule, rawPc)
 
 			// recover info to dialMetadata for smart
@@ -616,6 +625,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	if err != nil {
 		return
 	}
+	clearFakeIPDstIfNeeded(metadata)
 	logMetadata(metadata, rule, remoteConn)
 
 	// recover info to dialMetadata for smart
