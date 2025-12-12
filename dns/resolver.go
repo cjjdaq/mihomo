@@ -147,6 +147,18 @@ func (r *Resolver) ResolveECH(ctx context.Context, host string) ([]byte, error) 
 	}
 	return nil, errors.New("no ECH config found in DNS records")
 }
+func ttlUntil(expireTime time.Time) uint32 {
+	d := time.Until(expireTime)
+	if d <= 0 {
+		return 1
+	}
+	// 向上取整，最少 1 秒
+	sec := uint32((d + time.Second - 1) / time.Second)
+	if sec < 1 {
+		return 1
+	}
+	return sec
+}
 
 // ExchangeContext a batch of dns request with context.Context, and it use cache
 func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
@@ -171,12 +183,27 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
 		now := time.Now()
 		if expireTime.Before(now) {
-			setMsgTTL(msg, uint32(1)) // Continue fetch
-			continueFetch = true
+			// optimistic/stale cache window control
+			staleWindow := optimisticStaleMax()
+			if staleWindow > 0 {
+				staleAge := now.Sub(expireTime)
+				if staleAge <= staleWindow {
+					// serve stale and refresh in background
+					log.Debugln("[DNS] cache hit stale %s (expired at %s), refreshing in background", domain, expireTime.Format("2006-01-02 15:04:05"))
+					setMsgTTL(msg, uint32(1))
+					continueFetch = true
+					return
+				}
+			}
+			// too stale (or optimistic disabled): do not serve cache
+			log.Debugln("[DNS] cache expired %s at %s, querying upstream", domain, expireTime.Format("2006-01-02 15:04:05"))
+			return r.exchangeWithoutCache(ctx, m)
 		} else {
-			// updating TTL by subtracting common delta time from each DNS record
-			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
+			// 未过期，正常命中
 		}
+
+		// not expired: update TTL by remaining time
+		updateMsgTTL(msg, ttlUntil(expireTime))
 		return
 	}
 	return r.exchangeWithoutCache(ctx, m)
@@ -417,6 +444,8 @@ type NameServer struct {
 	ProxyName    string
 	Params       map[string]string
 	PreferH3     bool
+	// When true and ProxyName unwraps to a direct-compatible adapter, skip this upstream and use the direct resolver instead.
+	UseDirectWhenProxyIsDirect bool
 }
 
 func (ns NameServer) Equal(ns2 NameServer) bool {
@@ -429,7 +458,8 @@ func (ns NameServer) Equal(ns2 NameServer) bool {
 		ns.ProxyAdapter == ns2.ProxyAdapter &&
 		ns.ProxyName == ns2.ProxyName &&
 		maps.Equal(ns.Params, ns2.Params) &&
-		ns.PreferH3 == ns2.PreferH3 {
+		ns.PreferH3 == ns2.PreferH3 &&
+		ns.UseDirectWhenProxyIsDirect == ns2.UseDirectWhenProxyIsDirect {
 		return true
 	}
 	return false
