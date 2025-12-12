@@ -18,7 +18,7 @@ import (
 	"github.com/samber/lo"
 	"golang.org/x/exp/maps"
 )
-
+const optimisticStaleMax = 24 * time.Hour // 乐观缓存最大允许过期时间（可改：5*time.Minute 等）
 type dnsClient interface {
 	ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error)
 	Address() string
@@ -146,7 +146,18 @@ func (r *Resolver) ResolveECH(ctx context.Context, host string) ([]byte, error) 
 	}
 	return nil, errors.New("no ECH config found in DNS records")
 }
-
+func ttlUntil(expireTime time.Time) uint32 {
+	d := time.Until(expireTime)
+	if d <= 0 {
+		return 1
+	}
+	// 向上取整，最少 1 秒
+	sec := uint32((d + time.Second - 1) / time.Second)
+	if sec < 1 {
+		return 1
+	}
+	return sec
+}
 // ExchangeContext a batch of dns request with context.Context, and it use cache
 func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
 	if len(m.Question) == 0 {
@@ -166,19 +177,30 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	q := m.Question[0]
 	domain := msgToDomain(m)
 	_, qTypeStr := msgToQtype(m)
-	cacheM, expireTime, hit := r.cache.GetWithExpire(q.String())
+		cacheM, expireTime, hit := r.cache.GetWithExpire(q.String())
 	if hit {
 		ips := msgToIP(cacheM)
 		log.Debugln("[DNS] cache hit %s --> %s %s, expire at %s", domain, ips, qTypeStr, expireTime.Format("2006-01-02 15:04:05"))
 		now := time.Now()
 		msg = cacheM.Copy()
+
 		if expireTime.Before(now) {
-			setMsgTTL(msg, uint32(1)) // Continue fetch
-			continueFetch = true
-		} else {
-			// updating TTL by subtracting common delta time from each DNS record
-			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
+			// optimistic/stale cache window control
+			if optimisticStaleMax > 0 {
+				staleAge := now.Sub(expireTime)
+				if staleAge <= optimisticStaleMax {
+					// serve stale and refresh in background
+					setMsgTTL(msg, uint32(1))
+					continueFetch = true
+					return
+				}
+			}
+			// too stale (or optimistic disabled): do not serve cache
+			return r.exchangeWithoutCache(ctx, m)
 		}
+
+		// not expired: update TTL by remaining time
+		updateMsgTTL(msg, ttlUntil(expireTime))
 		return
 	}
 	return r.exchangeWithoutCache(ctx, m)
