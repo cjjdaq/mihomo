@@ -44,7 +44,13 @@ const (
 	checkInterval            = 10 * time.Minute
 	flushQueueInterval       = 5 * time.Minute
 	rankingInterval          = 30 * time.Minute
+    // ASN cache housekeeping
+    asnCacheCleanupInterval = 6 * time.Hour
+    asnCacheMaxEntries      = 200000
 
+    // ASN cache TTLs (positive long, negative short)
+    asnCachePositiveTTL = 7 * 24 * time.Hour
+    asnCacheNegativeTTL = 2 * time.Hour
 	maxRetries               = 4
 	maxSelected              = 10
 
@@ -56,7 +62,211 @@ var (
 	flushQueueOnce       atomic.Bool
 	smartInitOnce        sync.Once
 )
+// ---------------- Ultra-fast ASN cache (stdlib only) ----------------
+// Key design (avoid allocations):
+// - IPv4: kind=4 + uint32
+// - IPv6: kind=6 + [16]byte
+type ipKey struct {
+    kind uint8 // 4 or 6
+    v4   uint32
+    v6   [16]byte
+}
 
+func makeIPKey(ip netip.Addr) (ipKey, bool) {
+    if !ip.IsValid() {
+        return ipKey{}, false
+    }
+    if ip.Is4() {
+        b := ip.As4()
+        v := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+        return ipKey{kind: 4, v4: v}, true
+    }
+    b := ip.As16()
+    var a [16]byte
+    copy(a[:], b[:])
+    return ipKey{kind: 6, v6: a}, true
+}
+
+type asnCacheEntry struct {
+    asn      string
+    aso      string
+    expireAt int64 // unix nano, faster compare
+}
+
+// minimal singleflight (per-key in-flight suppression)
+type flightGroup struct {
+    mu sync.Mutex
+    m  map[ipKey]*flightCall
+}
+
+type flightCall struct {
+    wg  sync.WaitGroup
+    res asnCacheEntry
+}
+
+func (g *flightGroup) do(k ipKey, fn func() asnCacheEntry) asnCacheEntry {
+    g.mu.Lock()
+    if g.m == nil {
+        g.m = make(map[ipKey]*flightCall, 1024)
+    }
+    if c, ok := g.m[k]; ok {
+        g.mu.Unlock()
+        c.wg.Wait()
+        return c.res
+    }
+    c := &flightCall{}
+    c.wg.Add(1)
+    g.m[k] = c
+    g.mu.Unlock()
+
+    c.res = fn()
+    c.wg.Done()
+
+    g.mu.Lock()
+    delete(g.m, k)
+    g.mu.Unlock()
+    return c.res
+}
+
+// sharded map cache
+const asnShardCount = 64 // power of two
+
+type asnShard struct {
+    mu sync.RWMutex
+    m  map[ipKey]asnCacheEntry
+}
+
+type asnIPCache struct {
+    shards [asnShardCount]asnShard
+    sf     flightGroup
+}
+
+func (c *asnIPCache) init() {
+    for i := range c.shards {
+        if c.shards[i].m == nil {
+            c.shards[i].m = make(map[ipKey]asnCacheEntry, 4096)
+        }
+    }
+}
+
+func (c *asnIPCache) shardFor(k ipKey) *asnShard {
+    var h uint64
+    h = uint64(k.kind) * 1315423911
+    if k.kind == 4 {
+        h ^= uint64(k.v4) * 2654435761
+    } else {
+        h ^= uint64(uint32(k.v6[0])<<24|uint32(k.v6[1])<<16|uint32(k.v6[2])<<8|uint32(k.v6[3])) * 2246822519
+        h ^= uint64(uint32(k.v6[12])<<24|uint32(k.v6[13])<<16|uint32(k.v6[14])<<8|uint32(k.v6[15])) * 3266489917
+    }
+    return &c.shards[h&(asnShardCount-1)]
+}
+
+func (c *asnIPCache) get(k ipKey, nowN int64) (asnCacheEntry, bool) {
+    s := c.shardFor(k)
+    s.mu.RLock()
+    e, ok := s.m[k]
+    s.mu.RUnlock()
+    if !ok {
+        return asnCacheEntry{}, false
+    }
+    if nowN <= e.expireAt {
+        return e, true
+    }
+    // expired: best-effort delete
+    s.mu.Lock()
+    e2, ok2 := s.m[k]
+    if ok2 && nowN > e2.expireAt {
+        delete(s.m, k)
+    }
+    s.mu.Unlock()
+    return asnCacheEntry{}, false
+}
+
+func (c *asnIPCache) set(k ipKey, e asnCacheEntry) {
+    s := c.shardFor(k)
+    s.mu.Lock()
+    s.m[k] = e
+    s.mu.Unlock()
+}
+
+func (c *asnIPCache) cleanup(nowN int64, maxEntries int) (expired int, total int) {
+    for i := range c.shards {
+        s := &c.shards[i]
+        s.mu.Lock()
+        for k, e := range s.m {
+            total++
+            if nowN > e.expireAt {
+                delete(s.m, k)
+                expired++
+                total--
+            }
+        }
+        s.mu.Unlock()
+    }
+
+    if total <= maxEntries {
+        return
+    }
+
+    need := total - maxEntries
+    need += maxEntries / 20 // +5% hysteresis
+    if need < 1000 {
+        need = 1000
+    }
+
+    for i := range c.shards {
+        if need <= 0 {
+            break
+        }
+        s := &c.shards[i]
+        s.mu.Lock()
+        for k, e := range s.m {
+            if need <= 0 {
+                break
+            }
+            rem := e.expireAt - nowN
+            if rem < int64(48*time.Hour) || rand.Intn(10) == 0 {
+                delete(s.m, k)
+                need--
+            }
+        }
+        s.mu.Unlock()
+    }
+    return
+}
+
+// ---------------- string intern (ASN / ASO dedup, stdlib only) ----------------
+type stringInterner struct {
+    mu sync.RWMutex
+    m  map[string]string
+}
+
+func (si *stringInterner) init() {
+    if si.m == nil {
+        si.m = make(map[string]string, 1024)
+    }
+}
+
+func (si *stringInterner) intern(s string) string {
+    if s == "" {
+        return ""
+    }
+    si.mu.RLock()
+    if v, ok := si.m[s]; ok {
+        si.mu.RUnlock()
+        return v
+    }
+    si.mu.RUnlock()
+
+    si.mu.Lock()
+    if v, ok := si.m[s]; ok {
+        si.mu.Unlock()
+        return v
+    }
+    si.m[s] = s
+    si.mu.Unlock()
+    return s
+}
 type smartOption func(*Smart)
 
 type Smart struct {
@@ -84,6 +294,8 @@ type Smart struct {
 	useLightGBM    bool
 	collectData    bool
 	preferASN	   bool
+    asnCache    asnIPCache
+    asnInterner stringInterner
 }
 
 type dialResult struct {
@@ -141,12 +353,14 @@ func NewSmart(option *GroupCommonOption, providers []provider.ProxyProvider, opt
 	}
 
 	for _, option := range options {
-		option(s)
-	}
+    option(s)
+}
 
-	s.InitSmart()
+s.asnCache.init()
+s.asnInterner.init()
 
-	return s, nil
+s.InitSmart()
+return s, nil
 }
 
 func (s *Smart) GetConfigFilename() string {
@@ -621,6 +835,7 @@ func (s *Smart) InitSmart() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	smartInitOnce.Do(func() {
+		s.startTimedTask(30*time.Second, asnCacheCleanupInterval, "ASN cache cleanup", s.cleanupASNCache, false)
 		s.startTimedTask(5*time.Minute, checkInterval, "Clean up groups", s.cleanupOrphanedGroups, true)
 		s.startTimedTask(5*time.Second, cacheParamAdjustInterval, "Cache parameter adjustment", s.store.AdjustCacheParameters, false)
 		s.startTimedTask(5*time.Minute, flushQueueInterval, "Queue flush", func() {
@@ -1649,6 +1864,64 @@ func parseSmartOption(config map[string]any) ([]smartOption) {
 	return opts
 }
 
+func (s *Smart) cleanupASNCache() {
+    nowN := time.Now().UnixNano()
+    expired, total := s.asnCache.cleanup(nowN, asnCacheMaxEntries)
+    if expired > 0 {
+        log.Debugln("[Smart] ASN cache cleanup: expired=%d total~%d", expired, total)
+    }
+}
+
+func (s *Smart) lookupASNByIPCached(ip netip.Addr) (string, string) {
+    if !ip.IsValid() {
+        return "", ""
+    }
+    if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() {
+        return "", ""
+    }
+
+    k, ok := makeIPKey(ip)
+    if !ok {
+        return "", ""
+    }
+
+    nowN := time.Now().UnixNano()
+    if e, ok := s.asnCache.get(k, nowN); ok {
+        return e.asn, e.aso
+    }
+
+    e := s.asnCache.sf.do(k, func() asnCacheEntry {
+        nowN2 := time.Now().UnixNano()
+        if e2, ok2 := s.asnCache.get(k, nowN2); ok2 {
+            return e2
+        }
+
+        asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
+        asn = s.asnInterner.intern(asn)
+        aso = s.asnInterner.intern(aso)
+
+        if asn == "" {
+            exp := time.Now().Add(asnCacheNegativeTTL).UnixNano()
+            ne := asnCacheEntry{asn: "", aso: "", expireAt: exp}
+            s.asnCache.set(k, ne)
+            return ne
+        }
+
+        ttl := asnCachePositiveTTL
+        j := time.Duration(rand.Int63n(int64(6*time.Hour))) - 3*time.Hour
+        ttl += j
+        if ttl < 24*time.Hour {
+            ttl = 24 * time.Hour
+        }
+        exp := time.Now().Add(ttl).UnixNano()
+        pe := asnCacheEntry{asn: asn, aso: aso, expireAt: exp}
+        s.asnCache.set(k, pe)
+        return pe
+    })
+
+    return e.asn, e.aso
+}
+
 func (s *Smart) getASNCode(metadata *C.Metadata) string {
 	if metadata.DstIPASN == "unknown" {
 		return ""
@@ -1679,13 +1952,17 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 			ip = metadata.DstIP
 		}
 
-		asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
-		if asn == "" {
-			metadata.DstIPASN = "unknown"
-		} else {
-			metadata.DstIPASN = asn + " " + aso
-		}
-		return asn
+		asn, aso := s.lookupASNByIPCached(ip)
+if asn == "" {
+    metadata.DstIPASN = "unknown"
+    return ""
+}
+if aso != "" {
+    metadata.DstIPASN = asn + " " + aso
+} else {
+    metadata.DstIPASN = asn
+}
+return asn
 	}
 
 	return strings.SplitN(metadata.DstIPASN, " ", 2)[0]
