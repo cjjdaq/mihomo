@@ -24,7 +24,6 @@ import (
 	"github.com/metacubex/mihomo/common/singleflight"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/geodata"
-	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/smart"
@@ -1096,11 +1095,15 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 			ip = metadata.DstIP
 		}
 
-		asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
+		asn, aso := s.lookupASNByIPCached(ip)
 		if asn == "" {
 			metadata.DstIPASN = "unknown"
-		} else {
+			return ""
+		}
+		if aso != "" {
 			metadata.DstIPASN = asn + " " + aso
+		} else {
+			metadata.DstIPASN = asn
 		}
 		return asn
 	}
@@ -2137,8 +2140,9 @@ func (s *Smart) InitSmart() {
 	})
 
 	smartInitOnce.Do(func() {
-		s.startTimedTask(5*time.Minute, checkInterval, "Global orphaned groups Clean up", s.cleanupOrphanedGroups, true)
-		s.startTimedTask(5*time.Second, cacheParamAdjustInterval, "Global cache parameters adjustment", s.store.AdjustCacheParameters, false)
+		s.startTimedTask(30*time.Second, asnCacheCleanupInterval, "ASN cache cleanup", s.cleanupASNCache, false)
+		s.startTimedTask(5*time.Minute, checkInterval, "Clean up groups", s.cleanupOrphanedGroups, true)
+		s.startTimedTask(5*time.Second, cacheParamAdjustInterval, "Cache parameter adjustment", s.store.AdjustCacheParameters, false)
 		s.startTimedTask(5*time.Minute, flushQueueInterval, "Global queues flush", func() {
 			s.store.FlushQueue(true)
 		}, false)
