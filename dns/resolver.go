@@ -190,7 +190,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 				staleAge := now.Sub(expireTime)
 				if staleAge <= optimisticStaleMax {
 					// serve stale and refresh in background
-					log.Debugln("[DNS] cache hit stale %s (expired at %s), refreshing in background", domain, expireTime.Format("2006-01-02 15:04:05"))
+					log.Debugln("[DNS] cache hit stale %s --> %s %s (expired at %s), refreshing in background", domain, ips, qTypeStr, expireTime.Format("2006-01-02 15:04:05"))
 					setMsgTTL(msg, uint32(1))
 					continueFetch = true
 					return
