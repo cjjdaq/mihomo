@@ -180,7 +180,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		cacheM, expireTime, hit := r.cache.GetWithExpire(q.String())
 	if hit {
 		ips := msgToIP(cacheM)
-		log.Debugln("[DNS] cache hit %s --> %s %s, expire at %s", domain, ips, qTypeStr, expireTime.Format("2006-01-02 15:04:05"))
+		
 		now := time.Now()
 		msg = cacheM.Copy()
 
@@ -199,6 +199,8 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 			// too stale (or optimistic disabled): do not serve cache
 			log.Debugln("[DNS] cache expired %s at %s, querying upstream", domain, expireTime.Format("2006-01-02 15:04:05"))
 			return r.exchangeWithoutCache(ctx, m)
+		} else {
+			log.Debugln("[DNS] cache hit %s --> %s %s, expire at %s", domain, ips, qTypeStr, expireTime.Format("2006-01-02 15:04:05"))
 		}
 
 		// not expired: update TTL by remaining time
