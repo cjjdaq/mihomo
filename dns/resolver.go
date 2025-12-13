@@ -190,12 +190,14 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 				staleAge := now.Sub(expireTime)
 				if staleAge <= optimisticStaleMax {
 					// serve stale and refresh in background
+					log.Debugln("[DNS] cache hit stale %s, refreshing in background", domain)
 					setMsgTTL(msg, uint32(1))
 					continueFetch = true
 					return
 				}
 			}
 			// too stale (or optimistic disabled): do not serve cache
+			log.Debugln("[DNS] cache expired %s, querying upstream", domain)
 			return r.exchangeWithoutCache(ctx, m)
 		}
 
