@@ -142,11 +142,11 @@ type asnIPCache struct {
 }
 
 func (c *asnIPCache) init() {
-    for i := range c.shards {
-        if c.shards[i].m == nil {
-            c.shards[i].m = make(map[ipKey]asnCacheEntry, 4096)
-        }
-    }
+    //for i := range c.shards {
+        //if c.shards[i].m == nil {
+            //c.shards[i].m = make(map[ipKey]asnCacheEntry, 4096)
+        //}
+    //}
 }
 
 func (c *asnIPCache) shardFor(k ipKey) *asnShard {
@@ -164,6 +164,11 @@ func (c *asnIPCache) shardFor(k ipKey) *asnShard {
 func (c *asnIPCache) get(k ipKey, nowN int64) (asnCacheEntry, bool) {
     s := c.shardFor(k)
     s.mu.RLock()
+	if s.m == nil {
+    s.mu.RUnlock()
+    return asnCacheEntry{}, false
+    }
+
     e, ok := s.m[k]
     s.mu.RUnlock()
     if !ok {
@@ -185,6 +190,11 @@ func (c *asnIPCache) get(k ipKey, nowN int64) (asnCacheEntry, bool) {
 func (c *asnIPCache) set(k ipKey, e asnCacheEntry) {
     s := c.shardFor(k)
     s.mu.Lock()
+	if s.m == nil {
+        // small initial capacity; grows naturally
+        s.m = make(map[ipKey]asnCacheEntry, 256)
+    }
+
     s.m[k] = e
     s.mu.Unlock()
 }
