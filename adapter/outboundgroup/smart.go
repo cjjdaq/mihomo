@@ -164,11 +164,10 @@ func (c *asnIPCache) shardFor(k ipKey) *asnShard {
 func (c *asnIPCache) get(k ipKey, nowN int64) (asnCacheEntry, bool) {
     s := c.shardFor(k)
     s.mu.RLock()
-	if s.m == nil {
-    s.mu.RUnlock()
-    return asnCacheEntry{}, false
+    if s.m == nil {
+        s.mu.RUnlock()
+        return asnCacheEntry{}, false
     }
-
     e, ok := s.m[k]
     s.mu.RUnlock()
     if !ok {
@@ -179,9 +178,11 @@ func (c *asnIPCache) get(k ipKey, nowN int64) (asnCacheEntry, bool) {
     }
     // expired: best-effort delete
     s.mu.Lock()
-    e2, ok2 := s.m[k]
-    if ok2 && nowN > e2.expireAt {
-        delete(s.m, k)
+    if s.m != nil {
+        e2, ok2 := s.m[k]
+        if ok2 && nowN > e2.expireAt {
+            delete(s.m, k)
+        }
     }
     s.mu.Unlock()
     return asnCacheEntry{}, false
@@ -203,6 +204,10 @@ func (c *asnIPCache) cleanup(nowN int64, maxEntries int) (expired int, total int
     for i := range c.shards {
         s := &c.shards[i]
         s.mu.Lock()
+		if s.m == nil {
+           s.mu.Unlock()
+           continue
+        }
         for k, e := range s.m {
             total++
             if nowN > e.expireAt {
@@ -230,6 +235,10 @@ func (c *asnIPCache) cleanup(nowN int64, maxEntries int) (expired int, total int
         }
         s := &c.shards[i]
         s.mu.Lock()
+		if s.m == nil {
+           s.mu.Unlock()
+           continue
+        }
         for k, e := range s.m {
             if need <= 0 {
                 break
