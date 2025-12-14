@@ -1,0 +1,269 @@
+name: test-dev.Build
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag version to release"
+        required: true
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - ".github/ISSUE_TEMPLATE/**"
+    branches:
+      - test-dev
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - test-dev
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        jobs:
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3, debian: amd64, rpm: x86_64, pacman: x86_64}
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
+        go-version: '1.26'
+        check-latest: true
+
+    - name: Set variables
+      run: |
+        VERSION="${GITHUB_REF_NAME,,}-smart-$(git rev-parse --short HEAD)"
+        VERSION="${VERSION//\//-}"
+        PackageVersion="$(curl -s "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | jq -r '.tag_name' | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
+        if [ -n "${{ github.event.inputs.version }}" ]; then
+          VERSION=${{ github.event.inputs.version }}
+          PackageVersion="${VERSION#v}"
+        fi
+        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "PackageVersion=${PackageVersion}-smart" >> $GITHUB_ENV
+      
+        echo "BUILDTIME=$(date)" >> $GITHUB_ENV
+        echo "CGO_ENABLED=0" >> $GITHUB_ENV
+        echo "BUILDTAG=-extldflags --static" >> $GITHUB_ENV
+        echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
+
+    - name: Update CA
+      run: |
+        sudo apt-get update && sudo apt-get install ca-certificates
+        sudo update-ca-certificates
+        cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+    - name: Build core
+      env:
+        GOOS: ${{matrix.jobs.goos}}
+        GOARCH: ${{matrix.jobs.goarch}}
+        GOAMD64: ${{matrix.jobs.goamd64}}
+        GO386: ${{matrix.jobs.go386}}
+        GOARM: ${{matrix.jobs.goarm}}
+        GOMIPS: ${{matrix.jobs.gomips}}
+      run: |
+        go env
+        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+        if [ "${{matrix.jobs.goos}}" = "windows" ]; then
+          cp mihomo.exe mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+          zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+        else
+          cp mihomo mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
+          gzip -c mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}} > mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.gz
+          rm mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
+        fi
+
+    - name: Package DEB
+      if: matrix.jobs.debian != ''
+      run: |
+        set -xeuo pipefail
+        sudo gem install fpm
+        cp .github/release/.fpm_systemd .fpm
+
+        fpm -t deb \
+          -v "${PackageVersion}" \
+          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.deb" \
+          --architecture ${{ matrix.jobs.debian }} \
+          mihomo=/usr/bin/mihomo
+
+    - name: Package RPM
+      if: matrix.jobs.rpm != ''
+      run: |
+        set -xeuo pipefail
+        sudo gem install fpm
+        cp .github/release/.fpm_systemd .fpm
+
+        fpm -t rpm \
+          -v "${PackageVersion}" \
+          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.rpm" \
+          --architecture ${{ matrix.jobs.rpm }} \
+          mihomo=/usr/bin/mihomo
+
+    - name: Package Pacman
+      if: matrix.jobs.pacman != ''
+      run: |
+        set -xeuo pipefail
+        sudo gem install fpm
+        sudo apt-get update && sudo apt-get install -y libarchive-tools
+        cp .github/release/.fpm_systemd .fpm
+
+        fpm -t pacman \
+          -v "${PackageVersion}" \
+          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.pkg.tar.zst" \
+          --architecture ${{ matrix.jobs.pacman }} \
+          mihomo=/usr/bin/mihomo
+
+    - name: Save version
+      run: |
+        echo ${VERSION} > version.txt
+      shell: bash
+
+    - name: Archive production artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: "${{ matrix.jobs.goos }}-${{ matrix.jobs.output }}"
+        path: |
+          mihomo*.gz
+          mihomo*.deb
+          mihomo*.rpm
+          mihomo*.pkg.tar.zst
+          mihomo*.zip
+          version.txt
+          checksums.txt
+
+  Upload-Prerelease:
+    permissions: write-all
+    if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' && !startsWith(github.event_name, 'pull_request') }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all workflow run artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: bin/
+        merge-multiple: true
+
+    - name: Calculate checksums
+      run: |
+        cd bin/
+        find . -type f -not -name "checksums.*" -not -name "version.txt" | sort | xargs sha256sum > checksums.txt
+        cat checksums.txt
+      shell: bash
+
+    - name: Delete current release assets
+      uses: 8Mi-Tech/delete-release-assets-action@main
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        tag: Prerelease-${{ github.ref_name }}
+        deleteOnlyFromDrafts: false
+    - name: Set Env
+      run: |
+        echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Tag Repo
+      uses: richardsimko/update-tag@v1
+      with:
+        tag_name: Prerelease-${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+    - run: |
+        cat > release.txt << 'EOF'
+        **[声明]** 本分支是在上游代码的基础上增加Smart策略组功能，关于Smart策略组的任何问题均与上游无关!
+        **[Announcement]** This branch is based on the upstream code to add Smart Groups functionality, any questions about Smart Groups are not related to the upstream!
+
+        Release created at  ${{ env.BUILDTIME }}
+        Synchronize ${{ github.ref_name }} branch code updates, keeping only the latest version
+        <br>
+        [我应该下载哪个文件? / Which file should I download?](https://github.com/MetaCubeX/mihomo/wiki/FAQ)
+        [二进制文件筛选 / Binary file selector](https://metacubex.github.io/Meta-Docs/startup/#_1)
+        [查看文档 / Docs](https://metacubex.github.io/Meta-Docs/)
+
+        [Smart 策略组使用 / Smart Group Introduce](https://github.com/vernesong/OpenClash/releases/tag/mihomo)
+
+        EOF
+
+    - name: Upload Prerelease
+      uses: softprops/action-gh-release@v2
+      if: ${{  success() }}
+      with:
+        tag_name: Prerelease-${{ github.ref_name }}
+        name: "Mihomo ${{ github.ref_name }} with Smart Group"
+        files: |
+          bin/*
+        prerelease: true
+        generate_release_notes: true
+        body_path: release.txt
+
+  Upload-Release:
+    permissions: write-all
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: Meta
+          fetch-depth: '0'
+          fetch-tags: 'true'
+
+      - name: Get tags
+        run: |
+          echo "CURRENTVERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
+          git fetch --tags
+          echo "PREVERSION=$(git describe --tags --abbrev=0 HEAD)" >> $GITHUB_ENV
+
+      - name: Force push Alpha branch to Meta
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git fetch origin test-dev:test-dev
+          git push origin test-dev:Meta --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag the commit on Alpha
+        run: |
+          git checkout test-dev 
+          git tag ${{ github.event.inputs.version }}
+          git push origin ${{ github.event.inputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate release notes
+        run: |
+            cp ./.github/genReleaseNote.sh ./
+            bash ./genReleaseNote.sh -v ${PREVERSION}...${CURRENTVERSION}
+            rm ./genReleaseNote.sh
+  
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin/
+          merge-multiple: true
+  
+      - name: Display structure of downloaded files
+        run: ls -R
+        working-directory: bin
+  
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        if: ${{ success() }}
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          files: bin/*
+          body_path: release.md
