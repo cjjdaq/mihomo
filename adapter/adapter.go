@@ -171,6 +171,16 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["routing-mark"] = proxyInfo.RoutingMark
 	mapping["provider-name"] = proxyInfo.ProviderName
 	mapping["dialer-proxy"] = proxyInfo.DialerProxy
+	if addr := p.Addr(); addr != "" {
+		// addr 通常是 "host:port"
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil && host != "" {
+			mapping["addr"] = host
+		} else {
+			// 兜底：有些 addr 可能本来就没端口（或不是 host:port 形式）
+			mapping["addr"] = addr
+		}
+	}
 
 	return json.Marshal(mapping)
 }
