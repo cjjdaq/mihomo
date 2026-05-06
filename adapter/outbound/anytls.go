@@ -11,6 +11,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/anytls"
 	"github.com/metacubex/mihomo/transport/vmess"
 
@@ -120,6 +121,7 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
 		IdleSessionTimeout:       time.Duration(option.IdleSessionTimeout) * time.Second,
 		MinIdleSession:           option.MinIdleSession,
 		DisableReuse:             option.DisableReuse,
+		Name:                     option.Name,
 	}
 	echConfig, err := option.ECHOpts.Parse()
 	if err != nil {
@@ -172,5 +174,40 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
 	client := anytls.NewClient(context.TODO(), tOption)
 	outbound.client = client
 
+	// 启动主动预热：异步建立 min-idle-session 个 TLS 会话放入空闲池
+	// 让节点启动后第一个真实请求即可 0-RTT 复用，避免冷启动握手延迟
+	// disable-reuse 时无空闲池，预热无意义
+	if !option.DisableReuse && option.MinIdleSession > 0 {
+		go warmupAnyTLSSessions(option.Name, client, option.MinIdleSession)
+	}
+
 	return outbound, nil
+}
+
+// warmupAnyTLSSessions 后台逐个建立空闲会话，避免一次性突发握手
+//
+// 单次会话建立失败不阻塞后续，只记录调试日志：节点本身不可用时
+// 真实流量也会失败，预热失败属于预期可恢复情况。
+func warmupAnyTLSSessions(name string, client *anytls.Client, count int) {
+	const (
+		warmupDialTimeout    = 8 * time.Second
+		warmupSessionDelayMs = 200 // 会话间间隔，防止瞬时多个 TLS 握手集中
+	)
+
+	// 启动后稍等片刻，让 mihomo 初始化完成（DNS、interface 绑定等）
+	time.Sleep(2 * time.Second)
+
+	for i := 0; i < count; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), warmupDialTimeout)
+		err := client.Warmup(ctx)
+		cancel()
+		if err != nil {
+			log.Debugln("[AnyTLS] %s warmup session %d/%d failed: %v", name, i+1, count, err)
+		} else {
+			log.Debugln("[AnyTLS] %s warmup session %d/%d ok", name, i+1, count)
+		}
+		if i < count-1 {
+			time.Sleep(warmupSessionDelayMs * time.Millisecond)
+		}
+	}
 }

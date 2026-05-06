@@ -27,6 +27,8 @@ type ClientConfig struct {
 	Server                   M.Socksaddr
 	Dialer                   N.Dialer
 	TLSConfig                *vmess.TLSConfig
+	// Name outbound 节点名，用于让底层 session 日志带上节点标识便于排查
+	Name string
 }
 
 type Client struct {
@@ -48,7 +50,8 @@ func NewClient(ctx context.Context, config ClientConfig) *Client {
 	}
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
-	c.sessionClient = session.NewClient(ctx, c.createOutboundTLSConnection, &c.padding, config.ClientMetadata, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MinIdleSession, config.DisableReuse)
+c.sessionClient = session.NewClient(ctx, c.createOutboundTLSConnection, &c.padding, config.ClientMetadata, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MinIdleSession, config.DisableReuse)
+	c.sessionClient.SetLogName(config.Name)
 	return c
 }
 
@@ -100,4 +103,21 @@ func (c *Client) createOutboundTLSConnection(ctx context.Context) (net.Conn, err
 
 func (h *Client) Close() error {
 	return h.sessionClient.Close()
+}
+
+// Warmup 主动建立一条空闲会话并放入空闲池。
+//
+// 实现原理：
+//  1. CreateStream 会在没有空闲会话时调用 createSession 建立一条新 TLS 会话；
+//  2. stream.Close() 触发 dieHook，把所属 session 写入 idleSession 跳表；
+//  3. 之后真实请求来时直接从空闲池拿，省掉一次 TLS 握手。
+//
+// 该方法不写入任何业务数据（不调用 CreateProxy），仅在 anytls 多路复用层
+// 开关一次流，用于"预热 + 占位"。失败时不影响后续真实连接。
+func (h *Client) Warmup(ctx context.Context) error {
+	stream, err := h.sessionClient.CreateStream(ctx)
+	if err != nil {
+		return err
+	}
+	return stream.Close()
 }
