@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,21 @@ type HealthCheckOption struct {
 	URL      string
 	Interval uint
 }
+
+// 健康检查抖动参数（纯靠时间错开避免上游反滥用，不再做并发墙限制）
+//
+// 思路：
+//   - 不限并发：避免信号量排队消耗调用方 ctx 时间
+//   - 用大窗口随机抖动让所有节点的握手在窗口内均匀分布
+//   - 100 节点 / 3000ms 窗口 ≈ 33 RPS，多数 provider 反滥用阈值是 100+ RPS
+//   - healthcheck 通常给 15s 超时，3s 抖动 + 5s 单次握手仍有充足余量
+const (
+	healthCheckJitterMaxMs = 3000
+	// healthCheckStartupDelayMaxMs 启动后首次健康检查的随机延迟上限
+	// 避免多个 provider 在 mihomo 启动同一刻同时触发首次检查，形成 N×nodes 量级的握手风暴
+	// 手动通过 API 触发的健康检查不走 process()，不受此延迟影响
+	healthCheckStartupDelayMaxMs = 30000
+)
 
 type extraOption struct {
 	expectedStatus utils.IntRanges[uint16]
@@ -43,7 +59,21 @@ type HealthCheck struct {
 
 func (hc *HealthCheck) process() {
 	ticker := time.NewTicker(hc.interval)
-	go hc.check()
+	// 首次检查延迟一个随机窗口，错开多个 provider 启动时的瞬时握手压力
+	go func() {
+		if healthCheckStartupDelayMaxMs > 0 {
+			delay := time.Duration(rand.Intn(healthCheckStartupDelayMaxMs)) * time.Millisecond
+			log.Debugln("Health check startup delay: %v (url=%s)", delay, hc.url)
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-hc.ctx.Done():
+				timer.Stop()
+				return
+			}
+		}
+		hc.check()
+	}()
 	for {
 		select {
 		case <-ticker.C:
@@ -129,7 +159,7 @@ func (hc *HealthCheck) check() {
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)
-		b.SetLimit(10)
+		// 不限并发，依赖 execute 中的随机抖动错开实际握手时刻
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
@@ -178,6 +208,17 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 
 		p := proxy
 		b.Go(func() error {
+			// 加入随机抖动，避免所有节点同步发起握手导致瞬时突发
+			if healthCheckJitterMaxMs > 0 {
+				jitter := time.Duration(rand.Intn(healthCheckJitterMaxMs)) * time.Millisecond
+				timer := time.NewTimer(jitter)
+				select {
+				case <-timer.C:
+				case <-hc.ctx.Done():
+					timer.Stop()
+					return nil
+				}
+			}
 			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
 			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
