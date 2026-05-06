@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,18 @@ import (
 
 	"github.com/dlclark/regexp2"
 	"golang.org/x/exp/slices"
+	"golang.org/x/sync/errgroup"
+)
+
+// dialFailedHealthCheckCooldown 失败触发的批量健康检查最小间隔
+// 节点被上游封禁时，所有连接都会失败，会反复命中失败阈值；如果每次都触发批量
+// 健康检查，会让 provider 持续承受高频探测形成雪崩。引入冷却窗口避免该问题。
+const dialFailedHealthCheckCooldown = 5 * time.Minute
+
+// API 触发的整组延迟测试（如 /group/{name}/delay）的抖动参数
+// 不限并发，仅靠抖动错开实际握手时刻
+const (
+	groupURLTestJitterMaxMs = 3000
 )
 
 type GroupBase struct {
@@ -34,6 +47,10 @@ type GroupBase struct {
 	testTimeout       int
 	maxFailedTimes    int
 	emptyFallback     C.Proxy
+
+	// healthCheckCooldown 记录最近一次因失败触发健康检查的时间戳（unix 秒）
+	// 用于防止节点被封禁后短时间内反复触发批量健康检查导致雪崩
+	lastHealthCheckTriggerSec atomic.Int64
 
 	// for GetProxies
 	getProxiesMutex  sync.Mutex
@@ -235,25 +252,36 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 }
 
 func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
-	var wg sync.WaitGroup
 	var lock sync.Mutex
 	mp := map[string]uint16{}
 	proxies := gb.GetProxies(false)
+
+	// 不限并发，仅靠随机抖动错开实际握手时刻
+	// N 节点 / W 窗口 ≈ N/W * 1000 RPS，对反滥用防护是远低于"全部同时拨"的
+	eg := new(errgroup.Group)
 	for _, proxy := range proxies {
 		proxy := proxy
-		wg.Add(1)
-		go func() {
+		eg.Go(func() error {
+			if groupURLTestJitterMaxMs > 0 {
+				jitter := time.Duration(rand.Intn(groupURLTestJitterMaxMs)) * time.Millisecond
+				timer := time.NewTimer(jitter)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return nil
+				}
+			}
 			delay, err := proxy.URLTest(ctx, url, expectedStatus)
 			if err == nil {
 				lock.Lock()
 				mp[proxy.Name()] = delay
 				lock.Unlock()
 			}
-
-			wg.Done()
-		}()
+			return nil
+		})
 	}
-	wg.Wait()
+	_ = eg.Wait()
 
 	if len(mp) == 0 {
 		return mp, fmt.Errorf("get delay: all proxies timeout")
@@ -271,9 +299,26 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 		return
 	}
 
+	// triggerHealthCheck 包装实际的健康检查触发，应用冷却窗口避免雪崩
+	triggerHealthCheck := func() {
+		nowSec := time.Now().Unix()
+		lastSec := gb.lastHealthCheckTriggerSec.Load()
+		cooldownSec := int64(dialFailedHealthCheckCooldown / time.Second)
+		if lastSec > 0 && nowSec-lastSec < cooldownSec {
+			log.Debugln("ProxyGroup: %s health check skipped due to cooldown (%ds remaining)",
+				gb.Name(), cooldownSec-(nowSec-lastSec))
+			return
+		}
+		// CAS 防止并发多个 goroutine 同时通过冷却检查
+		if !gb.lastHealthCheckTriggerSec.CompareAndSwap(lastSec, nowSec) {
+			return
+		}
+		fn()
+	}
+
 	go func() {
 		if strings.Contains(err.Error(), "connection refused") {
-			fn()
+			triggerHealthCheck()
 			return
 		}
 
@@ -293,7 +338,7 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 			log.Debugln("ProxyGroup: %s failed count: %d", gb.Name(), gb.failedTimes)
 			if gb.failedTimes >= gb.maxFailedTimes {
 				log.Warnln("because %s failed multiple times, activate health check", gb.Name())
-				fn()
+				triggerHealthCheck()
 			}
 		}
 	}()
