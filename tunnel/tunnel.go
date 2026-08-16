@@ -330,6 +330,22 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		var exist bool
 		proxy, exist = proxies[metadata.SpecialProxy]
 		if !exist {
+			// Subscription (provider) nodes are NOT in the global proxy table;
+			// look them up in providers so proxy-port-pool listeners bound to
+			// them can actually route traffic.
+			for _, pd := range providers {
+				for _, p := range pd.Proxies() {
+					if p.Name() == metadata.SpecialProxy {
+						proxy, exist = p, true
+						break
+					}
+				}
+				if exist {
+					break
+				}
+			}
+		}
+		if !exist {
 			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
 		}
 		return
