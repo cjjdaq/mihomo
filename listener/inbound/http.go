@@ -48,6 +48,14 @@ func (h *HTTP) Config() C.InboundConfig {
 	return h.config
 }
 
+// Users returns the configured auth users (nil if none).
+func (h *HTTP) Users() AuthUsers {
+	if h.config == nil {
+		return nil
+	}
+	return h.config.Users
+}
+
 // Address implements constant.InboundListener
 func (h *HTTP) Address() string {
 	var addrList []string
