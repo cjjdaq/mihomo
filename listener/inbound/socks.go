@@ -52,6 +52,14 @@ func (s *Socks) Config() C.InboundConfig {
 	return s.config
 }
 
+// Users returns the configured auth users (nil if none).
+func (s *Socks) Users() AuthUsers {
+	if s.config == nil {
+		return nil
+	}
+	return s.config.Users
+}
+
 // Close implements constant.InboundListener
 func (s *Socks) Close() error {
 	var errs []error
