@@ -53,6 +53,14 @@ func (m *Mixed) Config() C.InboundConfig {
 	return m.config
 }
 
+// Users returns the configured auth users (nil if none).
+func (m *Mixed) Users() AuthUsers {
+	if m.config == nil {
+		return nil
+	}
+	return m.config.Users
+}
+
 // Address implements constant.InboundListener
 func (m *Mixed) Address() string {
 	var addrList []string

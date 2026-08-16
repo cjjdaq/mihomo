@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/process"
+	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/smart/lightgbm"
 	"github.com/metacubex/mihomo/component/sniffer"
@@ -213,6 +215,7 @@ type Config struct {
 	Users         []auth.AuthUser
 	Proxies       map[string]C.Proxy
 	Listeners     map[string]C.InboundListener
+	ProxyPortPool RawProxyPortPool
 	Providers     map[string]P.ProxyProvider
 	RuleProviders map[string]P.RuleProvider
 	Tunnels       []LC.Tunnel
@@ -464,6 +467,7 @@ type RawConfig struct {
 	Rule          []string                  `yaml:"rules" json:"rule"`
 	SubRules      map[string][]string       `yaml:"sub-rules" json:"sub-rules"`
 	Listeners     []map[string]any          `yaml:"listeners" json:"listeners"`
+	ProxyPortPool RawProxyPortPool          `yaml:"proxy-port-pool" json:"proxy-port-pool"`
 	Hosts         map[string]any            `yaml:"hosts" json:"hosts"`
 	DNS           RawDNS                    `yaml:"dns" json:"dns"`
 	NTP           RawNTP                    `yaml:"ntp" json:"ntp"`
@@ -698,6 +702,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		return nil, err
 	}
 	config.Listeners = listeners
+	config.ProxyPortPool = rawCfg.ProxyPortPool
 
 	log.Infoln("Geodata Loader mode: %s", geodata.LoaderName())
 	log.Infoln("Geosite Matcher implementation: %s", geodata.SiteMatcherName())
@@ -1031,6 +1036,141 @@ func parseListeners(cfg *RawConfig) (listeners map[string]C.InboundListener, err
 
 	}
 	return
+}
+
+// RawProxyPortPool auto-assigns one mixed port per real proxy node.
+type RawProxyPortPool struct {
+	Enable    bool             `yaml:"enable" json:"enable"`
+	Listen    string           `yaml:"listen" json:"listen"`
+	StartPort int              `yaml:"start-port" json:"start-port"`
+	MaxPorts  int              `yaml:"max-ports" json:"max-ports"`
+	Users     []map[string]any `yaml:"users" json:"users"`
+}
+
+// poolExcludedTypes are builtin adapters and proxy-group types that never get a port.
+var poolExcludedTypes = map[C.AdapterType]bool{
+	C.Direct:      true,
+	C.Reject:      true,
+	C.RejectDrop:  true,
+	C.Compatible:  true,
+	C.Pass:        true,
+	C.PassRule:    true,
+	C.Rematch:     true,
+	C.Dns:         true,
+	C.Selector:    true,
+	C.Fallback:    true,
+	C.URLTest:     true,
+	C.LoadBalance: true,
+	C.Smart:       true,
+	C.Relay:       true,
+}
+
+// poolPortInRange reports whether port falls inside the pool range.
+func poolPortInRange(pool RawProxyPortPool, port int) bool {
+	return port >= pool.StartPort && port < pool.StartPort+pool.MaxPorts
+}
+
+func BuildProxyPortPoolListeners(pool RawProxyPortPool, proxies map[string]C.Proxy, manual map[string]C.InboundListener, allowLan bool) (map[string]C.InboundListener, error) {
+	result := make(map[string]C.InboundListener)
+	if pool.StartPort <= 0 {
+		pool.StartPort = 53000
+	}
+	if pool.MaxPorts <= 0 {
+		pool.MaxPorts = 200
+	}
+	if pool.Listen == "" {
+		if allowLan {
+			pool.Listen = "0.0.0.0"
+		} else {
+			pool.Listen = "127.0.0.1"
+		}
+	}
+
+	// collect candidate proxy names (sorted for deterministic order)
+	var names []string
+	for name, p := range proxies {
+		if poolExcludedTypes[p.Type()] {
+			continue
+		}
+		if _, exist := manual[name]; exist {
+			continue // manual listener owns this node
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// 1. restore stable ports from cache.db (same persistence as fakeip)
+	assigned := make(map[string]int, len(names))
+	used := make(map[int]string, len(names))
+	store := cachefile.GetProxyPortPoolStore()
+	for name, port := range store.AllPorts() {
+		if _, ok := proxies[name]; !ok {
+			store.RemovePort(name) // node gone, release its port
+			continue
+		}
+		if _, exist := manual[name]; exist {
+			store.RemovePort(name) // manual listener owns this node
+			continue
+		}
+		if !poolPortInRange(pool, port) {
+			log.Warnln("proxy-port-pool: cached port %d of proxy %s out of pool range, reassign", port, name)
+			continue
+		}
+		if _, conflict := used[port]; conflict {
+			log.Warnln("proxy-port-pool: cached port %d of proxy %s conflicts, reassign", port, name)
+			continue
+		}
+		assigned[name] = port
+		used[port] = name
+	}
+
+	// 2. assign ports to new nodes, first free port from start-port upward
+	next := pool.StartPort
+	for _, name := range names {
+		if _, ok := assigned[name]; ok {
+			continue
+		}
+		if len(assigned) >= pool.MaxPorts {
+			log.Warnln("proxy-port-pool: proxy count exceeds max-ports %d, stop assigning ports", pool.MaxPorts)
+			break
+		}
+		for used[next] != "" {
+			next++
+		}
+		if next >= pool.StartPort+pool.MaxPorts {
+			log.Warnln("proxy-port-pool: no free port for proxy %s within max-ports range", name)
+			break
+		}
+		assigned[name] = next
+		used[next] = name
+		store.PutPort(name, next)
+	}
+	for _, name := range names {
+		port, ok := assigned[name]
+		if !ok {
+			continue
+		}
+		mapping := map[string]any{
+			"type":      "mixed",
+			"name":      name,
+			"listen":    pool.Listen,
+			"port":      strconv.Itoa(port),
+			"proxy":     name,
+			"udp":       true,
+			"pool-port": true,
+		}
+		if len(pool.Users) > 0 {
+			mapping["users"] = pool.Users
+		}
+		inboundListener, err := listener.ParseListener(mapping)
+		if err != nil {
+			log.Errorln("proxy-port-pool: listener for proxy %s error, skip: %s", name, err.Error())
+			continue
+		}
+		result[name] = inboundListener
+		log.Infoln("proxy-port-pool: proxy %s -> mixed port %d", name, port)
+	}
+	return result, nil
 }
 
 func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider, err error) {

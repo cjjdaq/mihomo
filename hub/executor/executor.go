@@ -115,6 +115,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 
 	initInnerTcp()
 	loadProvider(cfg.Providers)
+	updateProxyPortPool(cfg, force)
 	updateProfile(cfg)
 	loadProvider(cfg.RuleProviders)
 	runtime.GC()
@@ -210,6 +211,49 @@ func updateListeners(general *config.General, listeners map[string]C.InboundList
 	listener.ReCreateShadowSocks(general.ShadowSocksConfig, tunnel.Tunnel)
 	listener.ReCreateVmess(general.VmessConfig, tunnel.Tunnel)
 	listener.ReCreateTuic(general.TuicServer, tunnel.Tunnel)
+}
+
+// updateProxyPortPool (re)builds the auto proxy-port-pool listeners AFTER
+// proxy providers are loaded, so subscription nodes are included. It merges
+// the generated listeners with the manual ones and patches the running set.
+func updateProxyPortPool(cfg *config.Config, force bool) {
+	if !cfg.ProxyPortPool.Enable {
+		return
+	}
+	// Every real node gets a pool port: explicit proxies from the config
+	// plus subscription nodes from providers. Manual `listeners` entries are
+	// never auto-assigned (resin output filters on the pool-port flag).
+	proxies := make(map[string]C.Proxy)
+	for name, p := range tunnel.Proxies() {
+		proxies[name] = p
+	}
+	for _, pv := range cfg.Providers {
+		if pv.VehicleType() == P.Compatible {
+			continue // "default" aggregates every node
+		}
+		for _, proxy := range pv.Proxies() {
+			name := proxy.Name()
+			if _, ok := proxies[name]; !ok {
+				proxies[name] = proxy
+			}
+		}
+	}
+	poolListeners, err := config.BuildProxyPortPoolListeners(cfg.ProxyPortPool, proxies, cfg.Listeners, cfg.General.AllowLan)
+	if err != nil {
+		log.Errorln("proxy-port-pool: build listeners error: %s", err.Error())
+		return
+	}
+	all := make(map[string]C.InboundListener, len(cfg.Listeners)+len(poolListeners))
+	for name, l := range cfg.Listeners {
+		all[name] = l
+	}
+	for name, l := range poolListeners {
+		if _, exist := all[name]; exist {
+			continue // manual config takes precedence
+		}
+		all[name] = l
+	}
+	listener.PatchInboundListeners(all, tunnel.Tunnel, true)
 }
 
 func updateTun(general *config.General) {

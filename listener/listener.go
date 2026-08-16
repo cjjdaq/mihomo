@@ -624,25 +624,25 @@ func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) {
 	}
 }
 
+// InboundListeners returns a snapshot of all inbound listeners
+func InboundListeners() map[string]C.InboundListener {
+	inboundMux.Lock()
+	defer inboundMux.Unlock()
+	snapshot := make(map[string]C.InboundListener, len(inboundListeners))
+	for name, l := range inboundListeners {
+		snapshot[name] = l
+	}
+	return snapshot
+}
+
 func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C.Tunnel, dropOld bool) {
 	inboundMux.Lock()
 	defer inboundMux.Unlock()
 
-	for name, newListener := range newListenerMap {
-		if oldListener, ok := inboundListeners[name]; ok {
-			if !oldListener.Config().Equal(newListener.Config()) {
-				_ = oldListener.Close()
-			} else {
-				continue
-			}
-		}
-		if err := newListener.Listen(tunnel); err != nil {
-			log.Errorln("Listener %s listen err: %s", name, err.Error())
-			continue
-		}
-		inboundListeners[name] = newListener
-	}
-
+	// Phase 1: close removed listeners first so their ports are freed before
+	// new listeners (e.g. proxy-port-pool reassigned ports) try to bind them.
+	// This is required for port reuse: a new listener can only bind a port
+	// that the removed listener just released.
 	if dropOld {
 		for name, oldListener := range inboundListeners {
 			if _, ok := newListenerMap[name]; !ok {
@@ -650,6 +650,38 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
 				delete(inboundListeners, name)
 			}
 		}
+	}
+
+	// Phase 2: open new listeners.
+	// Same-name replacements that keep the same address must close the old
+	// listener first (the port is occupied, there is no way around it).
+	// Replacements that move to a different address open the new listener
+	// first and only close the old one on success, so a bind failure never
+	// takes down the running listener (zero-downtime update).
+	for name, newListener := range newListenerMap {
+		oldListener, hasOld := inboundListeners[name]
+		if hasOld && oldListener.Config().Equal(newListener.Config()) {
+			continue
+		}
+
+		closeOld := false
+		if hasOld && oldListener.RawAddress() == newListener.RawAddress() {
+			closeOld = true
+			_ = oldListener.Close()
+			delete(inboundListeners, name)
+		}
+
+		if err := newListener.Listen(tunnel); err != nil {
+			log.Errorln("Listener %s listen err: %s", name, err.Error())
+			if closeOld {
+				log.Errorln("Listener %s: old listener closed but new listener failed to bind %s, service on this port is down", name, newListener.RawAddress())
+			}
+			continue
+		}
+		if hasOld && !closeOld {
+			_ = oldListener.Close()
+		}
+		inboundListeners[name] = newListener
 	}
 }
 
