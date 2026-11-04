@@ -19,6 +19,12 @@ const (
 	TCP NetWork = iota
 	UDP
 	ALLNet
+	// QUIC is rule-only: it may appear in a NETWORK rule payload but must
+	// never be written into Metadata.NetWork, which stays TCP or UDP.
+	// The application-layer protocol is carried by Metadata.SniffProtocol
+	// instead, and process/smart/log paths rely on NetWork.String() only
+	// ever returning "tcp" or "udp".
+	QUIC
 	InvalidNet = 0xff
 )
 
@@ -71,6 +77,8 @@ func (n NetWork) String() string {
 		return "udp"
 	case ALLNet:
 		return "all"
+	case QUIC:
+		return "quic"
 	default:
 		return "invalid"
 	}
@@ -223,6 +231,12 @@ type Metadata struct {
 	RawDstAddr net.Addr `json:"-"`
 	// Only domain rule
 	SniffHost string `json:"sniffHost"`
+	// SniffProtocol records the application-layer protocol detected by the
+	// sniffer. Currently only "quic" is set (by QUICSniffer). Empty means
+	// unknown: the sniffer was disabled, the port was not in the whitelist,
+	// the flow was already past its Initial packet, or detection failed.
+	// A NETWORK,quic rule never matches an empty value.
+	SniffProtocol string `json:"sniffProtocol"`
 }
 
 func (m *Metadata) RemoteAddress() string {
