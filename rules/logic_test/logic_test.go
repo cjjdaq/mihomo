@@ -61,3 +61,42 @@ func TestOR(t *testing.T) {
 	}, C.RuleMatchHelper{})
 	assert.Equal(t, true, m)
 }
+
+func TestANDWithQUIC(t *testing.T) {
+	and, err := NewAND("((NETWORK,quic),(DST-PORT,443))", "REJECT", ParseRule)
+	assert.NoError(t, err)
+
+	// matched: confirmed QUIC on 443
+	m, _ := and.Match(&C.Metadata{
+		NetWork:       C.UDP,
+		DstPort:       443,
+		SniffProtocol: "quic",
+	}, C.RuleMatchHelper{})
+	assert.True(t, m)
+
+	// not matched: same port, but not QUIC (the false positive this solves)
+	m, _ = and.Match(&C.Metadata{
+		NetWork: C.UDP,
+		DstPort: 443,
+	}, C.RuleMatchHelper{})
+	assert.False(t, m)
+
+	// not matched: QUIC on a different port
+	m, _ = and.Match(&C.Metadata{
+		NetWork:       C.UDP,
+		DstPort:       8443,
+		SniffProtocol: "quic",
+	}, C.RuleMatchHelper{})
+	assert.False(t, m)
+}
+
+func TestNOTWithQUIC(t *testing.T) {
+	not, err := NewNOT("((NETWORK,quic))", "DIRECT", ParseRule)
+	assert.NoError(t, err)
+
+	m, _ := not.Match(&C.Metadata{NetWork: C.UDP, SniffProtocol: "quic"}, C.RuleMatchHelper{})
+	assert.False(t, m)
+
+	m, _ = not.Match(&C.Metadata{NetWork: C.UDP}, C.RuleMatchHelper{})
+	assert.True(t, m)
+}

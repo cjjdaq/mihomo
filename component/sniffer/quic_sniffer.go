@@ -107,6 +107,12 @@ type quicInitialKey struct {
 var _ sniffer.Sniffer = (*QUICSniffer)(nil)
 var _ sniffer.MultiPacketSniffer = (*QUICSniffer)(nil)
 
+// ProtocolQUIC is the application-layer protocol name this sniffer reports and
+// the value written into Metadata.SniffProtocol. It is exported so the rule
+// layer matches the sniffer through the same constant instead of duplicating
+// the literal.
+const ProtocolQUIC = "quic"
+
 type QUICSniffer struct {
 	*BaseSniffer
 }
@@ -122,7 +128,7 @@ func NewQUICSniffer(snifferConfig SnifferConfig) (*QUICSniffer, error) {
 }
 
 func (sniffer *QUICSniffer) Protocol() string {
-	return "quic"
+	return ProtocolQUIC
 }
 
 func (sniffer *QUICSniffer) SupportNetwork() C.NetWork {
@@ -151,6 +157,13 @@ type quicPacketSender struct {
 	receivedCryptoData  bitmap
 	contiguousCryptoEnd uint64
 	result              string
+	// isQUIC is set once a whole UDP datagram has been parsed as well-formed
+	// QUIC (version whitelist plus consistent connection ID, token and length
+	// fields). It is independent of whether the TLS ClientHello can be
+	// assembled into a SNI, so ECH, SNI-less and fragmented flows still count.
+	// It is a latch: close() intentionally does not clear it, so the verdict
+	// survives for the whole lifetime of this NAT entry.
+	isQUIC bool
 
 	replaceDomain sniffer.ReplaceDomain
 
@@ -182,15 +195,30 @@ func (q *quicPacketSender) Send(current constant.PacketAdapter) {
 
 // DoSniff wait sniffer recv all fragments and update the domain
 func (q *quicPacketSender) DoSniff(metadata *constant.Metadata) error {
+	var isQUIC bool
+
 	select {
 	case <-q.done:
 		q.lock.RLock()
+		isQUIC = q.isQUIC
 		if r := q.result; r != "" {
 			q.replaceDomain(metadata, r)
 		}
 		q.lock.RUnlock()
 	case <-time.After(quicWaitConn):
+		// The connection may be QUIC even though no SNI was assembled in
+		// time (0-RTT/Handshake first packet, ECH, fragmented ClientHello),
+		// so the flag has to be read on this branch too.
+		q.lock.RLock()
+		isQUIC = q.isQUIC
+		q.lock.RUnlock()
 		q.close()
+	}
+
+	// Gate on isQUIC, never on result: result also stays empty for a
+	// confirmed QUIC flow whose SNI was never assembled.
+	if isQUIC {
+		metadata.SniffProtocol = ProtocolQUIC
 	}
 
 	return q.PacketSender.DoSniff(metadata)
@@ -232,6 +260,15 @@ func (q *quicPacketSender) readQUICData(b []byte) error {
 		b = b[packetLen:]
 		firstPacket = false
 	}
+
+	// Reaching this point means every packet in the datagram was parsed as a
+	// well-formed QUIC packet: the version whitelist matched AND the connection
+	// ID, token and length fields were all consistent. Only now is the flow
+	// confirmed to be QUIC; latching the flag at the version check alone would
+	// mislabel private protocols that happen to start with a QUIC version.
+	q.lock.Lock()
+	q.isQUIC = true
+	q.lock.Unlock()
 
 	domain, err := q.tryAssemble()
 	if err != nil {
